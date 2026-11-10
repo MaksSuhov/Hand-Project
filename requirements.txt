@@ -1,0 +1,15 @@
+# HTTP
+fastapi==0.162.3
+uvicorn==0.54.0
+
+# Валидация и настройки
+pydantic==2.14.3
+pydantic-settings==2.16.2
+
+# БД
+SQLAlchemy==2.1.8
+
+# LLM / агенты
+langchain==1.4.9
+langgraph==1.2.20
+openai==3.49.0
