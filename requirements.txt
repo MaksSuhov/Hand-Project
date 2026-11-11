@@ -7,7 +7,9 @@ pydantic==2.14.3
 pydantic-settings==2.16.2
 
 # БД
-SQLAlchemy==2.1.8
+sqlalchemy[asyncio]==2.1.8
+asyncpg==0.32.0
+alembic==1.20.1
 
 # LLM / агенты
 langchain==1.4.9
