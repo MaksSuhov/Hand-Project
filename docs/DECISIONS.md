@@ -37,3 +37,52 @@
 Варианты:  A — минимализм (`main.py` + `routers/`, всё в одном слое); B — готовый boilerplate из сети; C — свои слои `api` / `application` / `core` / `infrastructure` / `schemas`.
 Выбор:     C (создан пользователем). Даёт односторонние зависимости и место для каждой будущей сущности; на старте часть каталогов пустая.
 Последствия: масштабируется до среднего проекта, легко тестировать сервисы без HTTP/БД. Цена — риск преждевременных абстракций (`unit_of_work.py` до появления второго репозитория) и лишние переходы между файлами на мелких фичах. Пересмотреть, если после 3–5 фич правка одной фичи требует касания всех папок: тогда перейти на вертикальные срезы (`app/chat/…`) по фичам.
+
+## 0004. БД — async SQLAlchemy, Postgres + asyncpg — 2026-11-11
+
+Контекст:  LLM-клиент `AsyncOpenAI` и эндпоинты async; синхронный `Session` внутри async-эндпоинта блокирует event loop. Нужен способ ходить в БД, не смешивая sync и async.
+Варианты:  A — sync SQLAlchemy, вызовы в threadpool; B — async SQLAlchemy (`create_async_engine` / `async_sessionmaker`) + Postgres/`asyncpg`; C — SQLite + `aiosqlite` для разработки, Postgres позже.
+Выбор:     B — зафиксировано в коде 2026-11-11 (`DATABASE_URL=postgresql+asyncpg://…`, async engine/sessionmaker).
+Последствия: в окружении нужны `sqlalchemy[asyncio]` (тянет `greenlet`) и `asyncpg`; локально требуется запущенный Postgres (Docker); `alembic` пока не подключён. `asyncpg` + `greenlet` пока не записаны в `requirements.txt`. SQLite можно добавить позже для быстрых тестов, но диалект и поведение отличаются от Postgres.
+
+## 0005. Реальные пакеты: `__init__.py` во всех каталогах `app/` — 2026-11-11
+
+Контекст:  проект стартовал без `__init__.py` (PEP 420 namespace-пакеты). Из-за этого `from app.infrastructure.db import AsyncSessionLocal` был невозможен, `app/infrastructure/repositories/` не попадал в git, а тулинг (mypy, pytest, `find_packages`) вёл себя непредсказуемо.
+Варианты:  A — оставить namespace-пакеты; B — добавить `__init__.py` во все пакеты (пустые, кроме реэкспортов в `db/`); C — только в `db/` как точечный фикс.
+Выбор:     B — единообразно и предсказуемо; `db/__init__.py` — единственное исключение с реэкспортом `Base`, `engine`, `AsyncSessionLocal`. Модели там не импортируются: `import app.infrastructure.db.models` делается явно там, где нужен `Base.metadata` (как ожидает Alembic `env.py`).
+Последствия: импорт пакетов не зависит от `sys.path` и чужих `app/`; пустые каталоги хранятся в git. Правило: `__init__.py` — маркер/публичный API пакета, бизнес-логику и `create_engine` туда не кладём; подмодули импортируются напрямую (`from .db import Base`), чтобы не ловить циклы.
+
+## 0006. Первый срез чата: порт LLMProvider + адаптер RouterAI — 2026-11-11
+
+Контекст:  echo-ручка работала, но не использовала LLM; нужно провести реальный сценарий, не нарушив правило слоёв (`application` не знает про FastAPI/SQLAlchemy/`openai`) и не блокируя работу на неготовой БД.
+Варианты:  A — вызвать `openai` прямо в роутере (быстро, но слой `application` остаётся пустым); B — `ChatService` импортирует `AsyncOpenAI` (слои перепутаны, сервис не тестируется без сети); C — порт `LLMProvider` (`Protocol`) в `application`, адаптер `OpenAIChatClient` в `infrastructure`, связывание в `api/dependencies.py`.
+Выбор:     C — сервис зависит от абстракции, адаптер подменяется в тестах; RouterAI подключается через уже готовый `AsyncOpenAI`.
+Последствия: срез проверен живым запросом (`POST /chat` → ответ модели). История пока не сохраняется: `conversation_id` — echo, `0` означает «новый диалог»; следующий шаг — репозиторий + `ChatService(llm, repo)`. Ошибки провайдера не маппятся (сейчас выходят как 500), это записано в `PROGRESS.md`. Контракт: `conversation_id` необязателен, `path=''` (`POST /chat`; `/chat/` → 307).
+
+## 0007. История диалога: порт репозитория + сессия на запрос — 2026-11-11
+
+Контекст:  `POST /chat` вызывает LLM, но не сохраняет сообщения; `conversation_id` был echo. Нужно: создавать диалог, загружать историю, передавать её в модель, сохранять оба сообщения и не нарушить правило слоёв (`application` без FastAPI/SQLAlchemy).
+Варианты:  A — SQL/ORM прямо в `ChatService` (быстро, но слой `application` начинает зависеть от SQLAlchemy); B — репозиторий возвращает ORM-объекты `Conversation`/`Message` (сервис всё равно знает ORM); C — порт `ConversationRepository` (`Protocol`) + простой DTO `ChatMessage` в `application`, SQLAlchemy-репозиторий в `infrastructure/repositories/`.
+Выбор:     C. `ChatService` зависит от двух портов (`LLMProvider`, `ConversationRepository`); `LLMProvider.complete` принимает `Sequence[ChatMessage]`, поэтому в модель уходит история, а не одно сообщение. Репозиторий отдаёт `None` для несуществующего диалога; сервис поднимает `ConversationNotFoundError`, роутер переводит его в 404. Commit — один, в конце успешного сценария; при исключении сессия закрывается без commit. Так как сессия нужна на запрос, `get_chat_service` больше не под `lru_cache`; кешируется только `get_llm()`.
+Последствия: сценарий тестируется с фейковыми LLM и репозиторием; DI явный, транзакция видна в сервисе. Цена: DTO и порты — лишний слой для одного сценария; история уходит в LLM целиком (нужна обрезка); `create_all` создаёт таблицы, но не мигрирует схему — Alembic откладывается до стабилизации модели. Проверено fake LLM через ASGI и реальным RouterAI (модель воспроизвела число из предыдущей реплики).
+
+## 0008. Пакет `application/chat`: порты, DTO и ошибки отдельно — 2026-11-12
+
+Контекст:  после первой версии `chat_service.py` смешивал сценарий, порты, DTO и исключения; дальше добавляются streaming, новые ошибки и, возможно, второй провайдер — файл стал бы свалкой. Нужно место, куда складывать прикладной контракт, не заводя пустой `domain`.
+Варианты:  A — держать всё в `application/chat_service.py`; B — завести `app/domain/`; C — пакет `app/application/chat/` с `service.py`, `ports.py`, `dto.py`, `errors.py`.
+Выбор:     C. Порты — прикладной контракт, а не бизнес-правила; доменных инвариантов пока нет, поэтому `domain/` был бы пустым слоем (риск, о котором предупреждает ADR-0003). `domain/` появится по триггеру: правила ролей/лимитов/состояний, не зависящие от HTTP/БД, или второй bounded context.
+Последствия: договорённость — новые порты, DTO и ошибки чата пишутся только в `application/chat/` (`ports.py`, `dto.py`, `errors.py`), а не в `service.py` и не рядом с адаптерами. Импорты обновлены; `application/chat_service.py` удалён. `application` по-прежнему не импортирует FastAPI/SQLAlchemy/`openai`. Streaming-типы (чанк, событие ошибки) добавятся в этот же пакет.
+
+## 0009. Маппинг ошибок LLM-провайдера — 2026-11-12
+
+Контекст:  исключения `openai`/RouterAI выходили из `ChatService` наружу и FastAPI отдавал общий 500; клиент не отличал сбой провайдера от бага приложения, а тело ответа не давало понять причину.
+Варианты:  A — ловить `openai`-исключения прямо в `ChatService`; B — ловить их в роутере; C — адаптер переводит `OpenAIError` в прикладные `LLM*`, роутер маппит `ChatError` в HTTP.
+Выбор:     C. `_to_llm_error` в `openai_client.py`: `APITimeoutError` → `LLMTimeoutError`; `APIConnectionError` → `LLMUnavailableError`; `RateLimitError` → `LLMRateLimitedError`; `AuthenticationError`/`PermissionDeniedError` → `LLMConfigurationError`; `BadRequestError`/`UnprocessableEntityError`/`NotFoundError` → `LLMRequestRejectedError`; прочие `APIStatusError`/`OpenAIError` → `LLMUnavailableError`. Роутер: 504/502/429/503/422 соответственно, `ConversationNotFoundError` → 404. Исходное исключение сохраняется в `__cause__`, в тело уходит безопасное сообщение.
+Последствия: `application` не знает про `openai`; клиент получает осмысленный код, 502 не маскируется под баг. Цена: таблицу маппинга нужно поддерживать при смене провайдера; при streaming после отправки заголовков код поменять нельзя — ошибку придётся отдавать событием в потоке.
+
+## 0010. Alembic вместо ручного `create_all` — 2026-11-12
+
+Контекст:  таблицы создавались одноразовым `init_db.py` через `Base.metadata.create_all`; схема уже менялась (FK, timestamptz), и `create_all` не умеет мигрировать существующие таблицы.
+Варианты:  A — оставить `create_all` до стабилизации схемы; B — подключить Alembic сейчас; C — отложить Alembic до продакшена.
+Выбор:     B. `alembic==1.20.1`, async-шаблон; `env.py` берёт URL из `settings.DATABASE_URL` и `target_metadata = Base.metadata` (модели импортируются явно). Начальная ревизия `fa04bfd1fe77` создаёт `conversations`/`messages` с FK `ON DELETE CASCADE`, timestamptz и индексами. `init_db.py` удалён, чтобы не было второго источника схемы.
+Последствия: схема меняется только ревизиями: `alembic revision --autogenerate -m "…"` + `alembic upgrade head`; миграции хранятся в git. Startup не применяет миграции (нужен явный шаг деплоя). Autogenerate требует запущенной БД и корректного `Base.metadata`; ручные правки миграции иногда неизбежны (renames, data migrations).
