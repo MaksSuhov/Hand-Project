@@ -1,6 +1,6 @@
 # Состояние проекта
 
-Обновлено: 2026-11-12 (пакет `application/chat`, маппинг ошибок, Alembic)
+Обновлено: 2026-11-19 (окружение восстановлено, рабочая копия разбита на 9 коммитов и отправлена в `origin/main`; предыдущая запись 2026-11-16 — RAG на pgvector: образ БД заменён на `pgvector/pgvector:pg17`, синтетическая корпоративная база знаний — 16 документов / 75 чанков, ответы `/chat` и `/chat/stream` опираются на неё; eval-функции — следующий шаг)
 
 ## Сделано
 
@@ -9,7 +9,7 @@
 - Создано окружение проекта: `.venv` от python.org 3.14.7 (ADR-0002); Anaconda не задействована.
 - Создан каркас приложения по слоям (`api` / `application` / `core` / `infrastructure` / `schemas`), ADR-0003.
 - `app/main.py` — `GET /health` + подключённый `chat_router`; `title="Hand Project v 0.1.0"`.
-- Зависимости зафиксированы в `requirements.txt`; `.gitignore`; коммит `cae8fec`; remote нет.
+- Зависимости зафиксированы в `requirements.txt`; `.gitignore`; коммит `cae8fec`; remote тогда не было (появился позже — см. срез после `5fb8853`).
 - `.env` с RouterAI (ключ, base_url, модель `deepseek/deepseek-v4.1-flash-1017`) и `DATABASE_URL`; в git не попадает.
 - Настройки починены: `settings = Settings()` (`app/core/config.py:11`), `openai_client.py` использует экземпляр.
 - `app/application/chat_service.py` — обычный класс-заглушка `ChatService` (наследование `Base` убрано).
@@ -38,25 +38,72 @@
 - **Alembic внедрён** (ADR-0010): `alembic==1.20.1`, async `env.py` берёт URL из `settings.DATABASE_URL`, `target_metadata = Base.metadata`. Начальная миграция `alembic/versions/fa04bfd1fe77_create_chat_tables.py`; `upgrade head` → `downgrade base` → `upgrade head` проверены. `init_db.py` удалён: единственный источник схемы — миграции.
 - Проверено 2026-11-12: реальный RouterAI после рефакторинга — второй запрос воспроизвёл число «11» из истории; тестовые строки удалены.
 - Накопленный срез закоммичен 2026-11-12: 12 коммитов по слоям (пакеты → settings → зависимости → БД → Alembic → порты/DTO/ошибки → LLM → схемы → история → API → docs → `.zcodeignore`).
-- **Дальше по плану — streaming** (SSE/JSON-формат ещё не выбран): порт и контракт ответа будут меняться; учитывать, что после отправки заголовков код ошибки поменять нельзя.
+- **Окружение восстановлено 2026-11-19:** `.venv` пересоздан (python.org 3.14.7) + `pip install -r requirements.txt`; Docker Desktop запущен, `handproject-postgres` healthy, том переиспользован (75 чанков на месте), `alembic current` = `8d4b2f1c9a71`; `pytest -q` → 16 passed.
+- **Накопленный после `5fb8853` срез разобран на коммиты и запушен 2026-11-19** — 9 коммитов:
+  1. `build(deps)` — langfuse, pgvector, `langchain-text-splitters`, pytest;
+  2. `chore(infra)` — `compose.yaml` с `pgvector/pgvector:pg17`;
+  3. `refactor(api)` — сборка роутеров в `api_router` (ADR-0012);
+  4. `feat(observability)` — настройки RAG/Langfuse, `init_tracing()`/`shutdown_tracing()` в lifespan;
+  5. `feat(knowledge)` — порт/адаптеры базы знаний, grounding-промпт, модель и миграция `8d4b2f1c9a71`, корпус и сид;
+  6. `feat(chat)` — SSE `/chat/stream`, `ChatExchange`, `UnitOfWork`, `ChatCommand`/`ChatAnswer`/`Role`, маппинг ошибок, RAG в `ChatService`;
+  7. `test` — чат и SSE на фейках;
+  8. `test` — RAG grounding и деградация;
+  9. `docs` — ADR-0011…0017 и текущее состояние.
+  `origin/main` до пуша содержал только `cae8fec` (начальный каркас).
+- **Langfuse подключён в адаптер** (ADR-0011), `langfuse==5.2.0` записан в `requirements.txt`; агрегатор роутеров исправлен по ADR-0012:
+  - `app/infrastructure/observability/tracing.py` — `init_tracing()`/`shutdown_tracing()`, клиент создаётся явно из `settings` (`LANGFUSE_PUBLIC_KEY/SECRET_KEY/BASE_URL`), `environment="development"`, при пустом public key — no-op; `shutdown()` флашит батчи.
+  - `app/main.py` — `lifespan`: `init_tracing()` на старте, `shutdown_tracing()` на остановке; подключается один `api_router`.
+  - `application/chat/ports.py` — `LLMProvider.complete(..., *, conversation_id=None)`; `service.py` передаёт id диалога; `openai_client.py` импортирует `AsyncOpenAI` из `langfuse.openai`.
+  - **Дефект 5.2.0 (исправлен):** `session_id` (как и `user_id`/`tags`) не вырезается обёрткой из kwargs и уходит в OpenAI SDK → `TypeError: AsyncCompletions.create() got an unexpected keyword argument 'session_id'` → HTTP 500. В адаптере убран kwarg, вызов обёрнут в `with propagate_attributes(session_id=str(conversation_id))`.
+  - **Проверено 2026-11-12 end-to-end:** `POST /chat` → 200 (`{"conversation_id":2,"content":"Привет!"}`); Langfuse Observations API v2: generation `chat.completion`, `sessionId=2`, model `deepseek/deepseek-v4.1-flash-1017`, usage `input 39 / output 3`, `totalCost=0.00686`, latency 2.3 с, input/output заполнены. Тестовый диалог `2` удалён из БД (2 сообщения + 1 диалог).
+  - Попутно: Postgres был недоступен (`Docker daemon` не запущен) — это давало второй, независимый 500; после запуска Docker Desktop контейнер `handproject-postgres` поднялся сам.
+  - Вывод по streaming: обёртка поддерживает async-streaming и сама финализирует generation, поэтому при SSE Langfuse-код почти не меняется.
+- **SSE-стриминг реализован** (ADR-0013), проверено 2026-11-12 фейковым LLM и живым RouterAI:
+  - `POST /chat/stream` — `response_class=EventSourceResponse`, endpoint сам является async-генератором. FastAPI 0.162.3 ставит `text/event-stream; charset=utf-8`, `Cache-Control: no-cache`, `X-Accel-Buffering: no` и keep-alive `: ping` каждые 15 с; `sse-starlette` не понадобился.
+  - Контракт событий: `meta {conversation_id}` → `delta` (`raw_data`, сырой текст) → `done {conversation_id}`. Ошибки после отправки заголовков — `error {code, message}` с закрытием потока; ошибки до стрима остаются HTTP: `get_prepared_chat` ловит `ChatError` и отдаёт 404/422/… (позже переименован в `get_chat_exchange`, ADR-0014).
+  - `application`: `LLMProvider.stream(...) -> AsyncIterator[str]` (в `Protocol` объявлен через `def`, не `async def`), `PreparedChat` в `dto.py`, `ChatService.prepare()` + `ChatService.stream()`; `handle()` переиспользует `prepare()` (позже `PreparedChat` заменён на `ChatExchange`, ADR-0014).
+  - `OpenAIChatClient.stream()`: `stream=True`, `stream_options={'include_usage': True}`, `try/except OpenAIError` вокруг всей итерации (обрыв соединения приходит во время `async for`), `await stream.close()` в `finally`, `propagate_attributes` оборачивает всю итерацию.
+  - Проверено фейковым LLM: `meta/delta/done`, история в LLM (`user/assistant/user`), неизвестный диалог → 404, сбой провайдера → `delta`… + `error` (HTTP 200), `/chat` продолжает работать. Живой RouterAI (`deepseek/deepseek-v4.1-flash-1017`): 11 кадров, текст собран из `delta`, в БД user+assistant.
+  - Langfuse v2 (`fields=core,basic,usage,io,model`): стриминговая generation `chat.completion` с `sessionId`, моделью, input/output, usage `input 47 / output 25 / reasoning 212`, `totalCost=0.01764`. RouterAI подтверждённо поддерживает `include_usage` (финальный чанк: `choices=[]`, `usage.cost`).
+  - Тестовые строки удалены (диалог `4`).
+- **Рефакторинг слоёв (ADR-0014), проверено 2026-11-12 фейками:**
+  - `ChatCommand`/`ChatAnswer` развязали `application` от Pydantic-схем; `MAX_CONTENT_LENGTH` переехал в `application/chat/dto.py`, схема импортирует константу; маппинг — в роутере.
+  - `Role` — `StrEnum` (`user`/`assistant`); `add_message(conversation_id, ChatMessage)` вместо `str`-частей; репозиторий маппит `Role` на чтении/записи.
+  - `PreparedChat` заменён на `ChatExchange` (`application/chat/exchange.py`): `complete()`/`stream()` + `_finish()`; инвариант «user добавлен, ответ не сохранён» выражен типом.
+  - Commit переехал в `UnitOfWork` (`SQLAlchemyUnitOfWork`), у `ConversationRepository` убран; `ChatService` получает третий порт.
+  - Ошибки: одна таблица в `api/error_mapping.py` (`isinstance`), HTTP и SSE отдают `{code, message}`; в адаптере убрано дублирование payload/`session_id`.
+  - Проверка: `compileall` + фейковый LLM/repo/UoW — `/chat` 200, `/chat/stream` meta/delta/done, неизвестный диалог → 404 `conversation_not_found`, таймаут → 504 `provider_timeout` и SSE `error`, пустой/801 символ → 422. Живой RouterAI после рефакторинга не перепроверялся.
+- **Автотесты** (ADR-0015): `pytest 9.2.0` + `pytest-asyncio 1.5.0` в `requirements.txt`; `pytest.ini` (`asyncio_mode=auto`); `tests/conftest.py` — `FakeLLM`/`FakeRepository`/`FakeUnitOfWork` и подмена `get_chat_service` через `dependency_overrides`; `tests/test_chat.py` и `tests/test_chat_stream.py` — 14 тестов (200, история, 404, 504, 422, `meta/delta/done`, пять кодов SSE `error`). `pytest -q` → 14 passed за 0,04 с, без БД и сети.
+- **RAG на pgvector** (ADR-0016), проверено 2026-11-16 живым RouterAI:
+  - БД: `compose.yaml` с `pgvector/pgvector:pg17` (контейнер `handproject-postgres`, том `handproject_pgdata` переиспользован, данные сохранены). Расширение `vector 0.8.7`; collation после смены образа поправлена (`ALTER DATABASE ... REFRESH COLLATION VERSION` + `REINDEX DATABASE`).
+  - Миграция `8d4b2f1c9a71`: `CREATE EXTENSION vector`; таблица `knowledge_chunks` (`source`, `title`, `heading`, `chunk_index`, `content`, `embedding vector(1024)`, `created_at`), unique `(source, chunk_index)`, HNSW-индекс `vector_cosine_ops`. Проверены `downgrade -1` → `upgrade head`.
+  - Прикладной слой: `application/knowledge/` (`KnowledgeChunk`, порт `KnowledgeBase`, `KnowledgeError`); в `application/chat/` — `prompt.py` (grounding-промпт с источниками и запретом выдумывать), `Role.SYSTEM`, `ChatService(..., knowledge, top_k)`. Поиск идёт по текущему сообщению; при ошибке KB чат продолжает работать с пустым контекстом («Фрагменты не найдены»).
+  - Инфраструктура: `OpenAIEmbeddings` (`baai/bge-m3`, 1024 измерения, обычный `openai.AsyncOpenAI` — эмбеддинги не пишутся в Langfuse) и `PgVectorKnowledgeBase` (`ORDER BY embedding <=> vec LIMIT k`).
+  - Корпус: `knowledge_base/` — 16 документов вымышленной ООО «Северный Ветер» (HR, ИТ, финансы, продукт, поддержка, контакты) + два архивных документа-ловушки. Загрузка — `scripts/seed_knowledge.py` через LangChain-сплиттеры; 75 чанков, повторный запуск идемпотентен.
+  - Калибровка: релевантные чанки дают score 0.49–0.74, оффтоп ≤0.37 → `RAG_MIN_SCORE=0.45`, `RAG_TOP_K=5`.
+  - Живая проверка `/chat`: отпуск — 28 дней (архивные 24 не использованы), суточные за рубеж — 3 500 ₽, потеря ноутбука — 2 часа + ServiceDesk/ИБ, вопрос про борщ — корректный отказ, вопрос про 2022 год — ответ с пометкой «не действует». `/chat/stream` отдаёт `meta/delta/...` с тем же контекстом. Тестовые диалоги удалены.
+  - Тесты: 16 passed (`FakeKnowledge` в `conftest.py`, `tests/test_rag.py` — контекст в system-сообщении и graceful degradation).
 
 ## В работе
 
-- Streaming: ближайший функциональный шаг; формат ответа (SSE или JSON-поток) не выбран.
-- Автоматических тестов нет: проверки ручные (ASGI + фейковый LLM), `pytest` не установлен.
+- Langfuse: интегрирован (Cloud, drop-in обёртка), проверен и для `/chat`, и для `/chat/stream`; в UI не смотрели.
+- Автотесты: 16 тестов на `/chat`, `/chat/stream` и RAG (фейки); юнит-тестов адаптеров (`_to_llm_error`, embeddings) и проверки инкрементальности SSE в pytest пока нет.
+- RAG: контекст ищется только по текущему сообщению (без переформулировки вопроса) и не обрезается по токенам; корпус статичный — переиндексация только через `scripts.seed_knowledge`.
 - В модель уходит вся история без обрезки по токенам/длине.
 
 ## Блокеры
 
-1. `app/api/router.py` пуст, хотя задумывался как сборщик роутеров; `main.py` импортирует `chat_router` напрямую. Решить: заполнить агрегатор или удалить.
+- Нет (2026-11-19). Окружение восстановлено: `.venv` пересоздан, зависимости из `requirements.txt`, Postgres с pgvector поднят (`docker compose up -d`, контейнер healthy), БД на ревизии `8d4b2f1c9a71`, `pytest -q` → 16 passed.
+- Ранее блокеров не было. (`api/router.py` исправлен по ADR-0012; Langfuse-баг закрыт, HTTP-путь проверен; pgvector-образ и расширение работают.)
 
 ## Следующие шаги (в этом порядке)
 
-1. Streaming: выбрать формат (вероятно SSE), расширить `LLMProvider` (стриминговый метод) и контракт ответа; ошибки после начала потока отдавать событием, не HTTP-кодом.
-2. Тесты: pytest + httpx, фейковый LLM/репозиторий (паттерн override из `api/dependencies.py`).
-3. Ограничение истории: обрезка по числу сообщений/токенам перед вызовом LLM.
-4. Заполнить или удалить `app/api/router.py`.
-5. По мере изменения моделей — новая ревизия Alembic (`alembic revision --autogenerate`), не `create_all`.
+1. **Eval-прогоны** (следующий шаг по договорённости): набор вопросов/эталонных ответов по `knowledge_base/`, метрики retrieval (hit@k, MRR) и ответа (факт/число/источник), прогон против текущего пайплайна.
+2. Ограничение истории: обрезка по числу сообщений/токенам перед вызовом LLM (учесть system-промпт RAG).
+3. Query rewriting для follow-up вопросов («а сколько переносится?») — иначе поиск идёт по короткой фразе без контекста диалога.
+4. Посмотреть трейсы в UI Langfuse (Traces/Sessions) — данные уже доходят, включая стриминговые.
+5. Фронтенд: парсер SSE на `fetch` + `ReadableStream` (нативный `EventSource` не умеет `POST`).
+6. По желанию — hybrid search (BM25 + vector), rerank (voyage/rerank доступен в RouterAI), юнит-тесты `ChatExchange`/`ChatService`/адаптеров.
 
 ## Известные проблемы / замечания
 
@@ -67,29 +114,66 @@
 - ~~`ChatResponse.content` max_length~~ — закрыто.
 - ~~`Mapped[DateTime]` (`models.py:13,27`)~~ — закрыто: `Mapped[datetime]` + `DateTime(timezone=True)` (timestamptz).
 - ~~`get_session` без аннотации возврата~~ — закрыто: `AsyncGenerator[AsyncSession, None]`.
-- `Conversation()` создаётся без явных полей; `flush()` даёт `conversation_id`. Commit — в `ChatService` в конце сценария; при ошибке LLM сессия закрывается без commit (rollback).
+- `Conversation()` создаётся без явных полей; `flush()` даёт `conversation_id`. Commit — в `ChatExchange._finish` через `UnitOfWork`; при ошибке LLM сессия закрывается без commit (rollback).
 - История в LLM не ограничена: длинный диалог упрётся в контекст модели/лимит запроса. Нужна стратегия обрезки.
 - Alembic не подхватывает изменения моделей сам: после правки `models.py` нужна новая ревизия (`alembic revision --autogenerate`) и `alembic upgrade head`.
-- Streaming изменит обработку ошибок: если поток уже начат, HTTP-код ответа не поменять — ошибку придётся отдавать событием в потоке.
+- SSE: после первого кадра HTTP-код не поменять — сбои провайдера уходят событием `error`, а не-`ChatError` исключения рвут соединение (намеренно, это баги).
 - ~~`openai_client` создаётся на импорте~~ — закрыто: `OpenAIChatClient` создаёт клиент в `__init__`, есть `timeout=30.0` и `max_retries=2`.
 - `Settings` молча подставляет `"place your API key"` и дефолтный `DATABASE_URL` с паролем — лучше обязательные поля + `.env.example`.
 - `.env.example` предусмотрен в `.gitignore`, но файла нет.
 - ~~Нет `__init__.py` в `app/` и подпакетах~~ — закрыто (ADR-0005): все пакеты стали реальными; `repositories/` теперь хранится в git.
-- `pytest` не установлен; тестов нет.
+- ~~`pytest` не установлен; тестов нет~~ — закрыто (ADR-0015): 14 тестов, `.venv/bin/python -m pytest -q`. Тесты идут через HTTP-слой; отдельных юнит-тестов `ChatService`/`ChatExchange`/адаптера нет.
+- Langfuse 5.2.0: kwargs `session_id`/`user_id`/`tags` в `chat.completions.create` не вырезаются и ломают запрос; в адаптере уже используется `propagate_attributes(...)` — при добавлении `user_id`/`tags` делать так же.
+- `init_tracing()` вызывает синхронный `auth_check()` в async lifespan: до 5 с блокировки event loop на старте (сейчас проходит быстро).
+- `.env.example` нет; теперь ему нужны ещё `LANGFUSE_PUBLIC_KEY/SECRET_KEY/BASE_URL`.
+- Стоимость берётся из `usage.cost`, который возвращает RouterAI; для моделей/провайдеров без `cost` понадобится прайс в настройках проекта.
+- ~~Для streaming не проверено, поддерживает ли RouterAI `stream_options={"include_usage": True}`~~ — закрыто: поддерживает (финальный чанк с `choices=[]` и `usage.cost`), usage/cost попадают в стриминговый трейс Langfuse.
+- SSE держит соединение с БД на всё время стрима (сессия из `get_session` живёт до последнего чанка). Для одного-двух пользователей нормально; при нагрузке пул может кончиться — тогда финальное сохранение вынести в отдельную короткую сессию.
+- Обрыв клиента = отмена генератора и отсутствие `commit`: ответ не сохраняется, user-сообщение тоже (всё-или-ничего, как и в `/chat` при ошибке провайдера).
 - Code Runner в VS Code запускает Anaconda-питон вместо `.venv`.
-- `unit_of_work.py` пуст — сознательно не трогаем до второго репозитория (ADR-0003).
+- `unit_of_work.py` реализован (`SQLAlchemyUnitOfWork`, ADR-0014); второго репозитория пока нет.
+- `messages.role` — строка без check-констрейнта; `Role` проверяется при чтении в `SQLAlchemyConversationRepository` (неизвестное значение → `ValueError`). Если нужен инвариант в БД — миграция с `CHECK (role IN ('user','assistant'))`.
+- HTTP-ошибка теперь отдаёт `detail={"code", "message"}` вместо строки (ADR-0014); контракт SSE не менялся.
+- RAG: `RAG_MIN_SCORE=0.45` откалиброван на синтетическом корпусе и модели `baai/bge-m3`; при смене модели/корпуса порог надо перепроверить (у bge-m3 сжатая шкала сходства). Порог — единственная защита от оффтопа, без eval-набора.
+- RAG: размерность эмбеддинга зашита в модель и миграцию (`vector(1024)`). Смена модели на другую размерность = новая миграция + переиндексация всего корпуса.
+- RAG: архивные документы специально попадают в топ выдачи (score до 0.68) — корректность держится на промпте и пометке «Архив» в заголовке. Это осознанная ловушка для eval, а не дефект.
+- RAG: цитаты в ответе формирует модель по промпту — ссылки не проверяются программно; при eval стоит проверять `source` отдельно.
+- RAG: `scripts/seed_knowledge.py` не инкрементальный (удаляет и перезаливает чанки источника), удалённые из `knowledge_base/` файлы остаются в таблице до `--reset`.
+- RAG: эмбеддинги идут обычным `openai.AsyncOpenAI` (не через Langfuse): обёртка на `embeddings.create` создавала отдельные трейсы без сессии и шумела в логах сида.
+- `compose.yaml` переиспользует внешний том `handproject_pgdata`; при первом переходе с `postgres:17` на `pgvector/pgvector:pg17` нужен `REFRESH COLLATION VERSION` (сделано).
 
-## Внедрение LangChain / LangGraph / Langfuse — триггеры (рекомендация, не ADR; 2026-11-11)
+## Streaming — факты, на которые опирается реализация (2026-11-12)
 
-- В `.venv` стоят `langchain 1.4.9`, `langchain-core 1.7.7`, `langgraph 1.2.20`, `langgraph-checkpoint 4.3.1`; `langchain-openai` и `langfuse` не установлены.
-- **Langfuse — первым из троих**, после текущего шага streaming: от LangChain не зависит, правка в 1 файле `infrastructure/llm/`, даёт session/token/latency/cost; `session_id = conversation_id`.
-- **LangChain — по триггеру**: RAG/embeddings, tools/function calling, structured output, второй провайдер. Вставляется адаптером за существующий порт `LLMProvider`.
+- FastAPI 0.162.3 содержит встроенный SSE: `from fastapi.responses import EventSourceResponse`, `from fastapi.sse import ServerSentEvent`. Достаточно `response_class=EventSourceResponse` на endpoint-е, который сам является async-генератором; `sse-starlette` не нужен. FastAPI сам ставит заголовки, keep-alive и документирует ответ в OpenAPI.
+- `ServerSentEvent`: `event`, `data` (всегда JSON; строки уходят в кавычках с `\uXXXX`), `raw_data` (как есть), `id`, `retry`, `comment`. Если endpoint — async-генератор без `response_class`, FastAPI стримит JSONL (`application/jsonl`) — запасной вариант без event-фрейминга и keep-alive.
+- `Depends`-зависимости с `yield` живут до конца стриминга: `request_stack` в `fastapi/routing.py` оборачивает и вызов endpoint-а, и `await response(...)` (проверено в исходнике и в рантайме). Поэтому `get_session` работает внутри генератора, но соединение занято весь стрим.
+- HTTP-заголовки (200) отправляются до первого `yield`: ошибка до стрима меняет код только через зависимость; исключение внутри генератора рвёт соединение (`ExceptionGroup`), поэтому ошибки потока — событием `error`.
+
+## Внедрение LangChain / LangGraph / Langfuse — триггеры (обновлено 2026-11-12)
+
+- `langfuse 5.2.0` установлен и интегрирован (ADR-0011); `langchain 1.4.9`, `langgraph 1.2.20` стоят, `langchain-openai` нет.
+- **LangChain — включён точечно (ADR-0017)**: `langchain-text-splitters 1.1.3` используется только в `scripts/seed_knowledge.py` (`MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter`). Runtime-путь RAG — чистые SQLAlchemy/`openai`, без chains/vectorstore.
+- **Langfuse — сделан первым из троих**, до streaming: Cloud, drop-in `langfuse.openai.AsyncOpenAI` в адаптере, `session_id = conversation_id`; правка `application` — только параметр порта.
+- SDK v4+ (OpenTelemetry): актуальный API — `get_client()`, `start_as_current_observation(as_type=...)`, `propagate_attributes(...)`, `@observe`. Примеры v2 (`langfuse.trace()`, `generation()`) и v3 неприменимы; `langfuse` требует Python `>=3.11`.
+- **LangChain — по триггеру**: RAG/embeddings (включён частично, ADR-0017), tools/function calling, structured output, второй провайдер. Вставляется адаптером за существующий порт `LLMProvider` или отдельным портом.
 - **LangGraph — по триггеру**: ветвление/цикл, агент с инструментами, HITL, resume/checkpoint, streaming шагов. В 1.x агенты LangChain (`create_agent`) сами построены на LangGraph.
 - Checkpointer LangGraph — не хранилище истории продукта: история в своих таблицах, checkpointer только для состояния графа.
 - Версии 1.x: туториалы 0.x неприменимы (legacy chains вынесены в `langchain-classic`).
 
+## Ревью слоёв/ООП — 2026-11-12 (закрыто рефакторингом, ADR-0014)
+
+- `application` развязан от Pydantic-схем: `ChatCommand`/`ChatAnswer`, маппинг в роутере; `MAX_CONTENT_LENGTH` — в `dto.py`.
+- Транзакция вынесена в `UnitOfWork`/`SQLAlchemyUnitOfWork`; у репозитория `commit` убран.
+- `PreparedChat` заменён на `ChatExchange` (`complete`/`stream` + `_finish`); инвариант обмена внутри объекта.
+- `Role` — `StrEnum`; `add_message` принимает `ChatMessage`.
+- Ошибки: одна таблица `api/error_mapping.py`, поиск по `isinstance`, тело HTTP/SSE `{code, message}`.
+- Адаптер: `_to_payload`/`_to_session_id`/`_GENERATION_NAME` убрали дублирование.
+- Осталось: `role` в БД без check-констрейнта; `ruff` не подключён (косметика выправлена вручную в затронутых файлах).
+
 ## Открытые вопросы
 
 - Идея продукта формально не зафиксирована в `PRD.md` (по коду — LLM-чат с историей).
-- Streaming: SSE или другой формат (JSON-поток)? Решено делать streaming следующим, формат ещё нет.
+- Streaming: выбран SSE через встроенный `EventSourceResponse` (ADR-0013); JSONL остался запасным вариантом.
 - История: свои таблицы (выбранный путь) vs checkpointer LangGraph — зафиксировать, когда появится LangGraph.
+- Celery (2026-11-13, требование вакансии; разобрали устройство и порог входа): решение не принято, изучать — в отдельной песочнице, не в этом репозитории. Ключевой конфликт: воркеры Celery синхронные, а весь проект async (`asyncpg`, `AsyncSession`, `AsyncOpenAI`). Если понадобится фоновая обработка под текущий стек — сначала смотреть ARQ/TaskIQ (async-native); Celery — если нужен именно стандарт из вакансии.
+- Celery, окружение для песочницы (2026-11-13): десктопное приложение не нужно, всё из терминала. Брокер — `brew install redis` + `redis-server` (или `docker run redis:7-alpine`; Docker Desktop уже стоит, но демон сейчас выключен) либо RabbitMQ (тяжелее: Erlang). Воркер — `celery -A tasks worker`. `celery 5.7.0` объявляет Python 3.14 в классификаторах PyPI, т.е. `3.14.7` подходит. Flower — опциональный веб-UI из pip-пакета, не приложение.
