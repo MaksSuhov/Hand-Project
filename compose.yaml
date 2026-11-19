@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: handproject-postgres
+    environment:
+      POSTGRES_USER: handproject
+      POSTGRES_PASSWORD: handproject
+      POSTGRES_DB: handproject
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U handproject -d handproject"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+    name: handproject_pgdata
