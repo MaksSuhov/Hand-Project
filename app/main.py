@@ -1,10 +1,21 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
-from app.api.routes.chat_router import router as chat_router
+from app.api.router import api_router  
+from app.infrastructure.observability.tracing import init_tracing, shutdown_tracing
 
-app = FastAPI(title="Hand Project v 0.1.0")
 
-app.include_router(router=chat_router)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_tracing()
+    yield
+    shutdown_tracing()
+
+
+app = FastAPI(title="Hand Project v 0.1.0", lifespan=lifespan)
+
+app.include_router(router=api_router)
 
 @app.get('/health')
 async def health() -> str:
