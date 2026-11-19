@@ -1,29 +1,33 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from collections.abc import AsyncIterator
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import EventSourceResponse
+from fastapi.sse import ServerSentEvent
 
 from app.api.dependencies import get_chat_service
-from app.application.chat.errors import (
-    ChatError,
-    ConversationNotFoundError,
-    LLMConfigurationError,
-    LLMRateLimitedError,
-    LLMRequestRejectedError,
-    LLMTimeoutError,
-    LLMUnavailableError,
-)
+from app.api.error_mapping import to_http_error, to_sse_event
+from app.application.chat.dto import ChatAnswer, ChatCommand
+from app.application.chat.errors import ChatError
+from app.application.chat.exchange import ChatExchange
 from app.application.chat.service import ChatService
 from app.schemas.chat_schema import ChatRequest, ChatResponse
 
 
 router = APIRouter(prefix='/chat')
 
-_ERROR_STATUS: dict[type[ChatError], int] = {
-    ConversationNotFoundError: status.HTTP_404_NOT_FOUND,
-    LLMUnavailableError: status.HTTP_502_BAD_GATEWAY,
-    LLMTimeoutError: status.HTTP_504_GATEWAY_TIMEOUT,
-    LLMRateLimitedError: status.HTTP_429_TOO_MANY_REQUESTS,
-    LLMRequestRejectedError: status.HTTP_422_UNPROCESSABLE_CONTENT,
-    LLMConfigurationError: status.HTTP_503_SERVICE_UNAVAILABLE,
-}
+
+def _to_command(payload: ChatRequest) -> ChatCommand:
+    return ChatCommand(
+        content=payload.content,
+        conversation_id=payload.conversation_id,
+    )
+
+
+def _to_response(answer: ChatAnswer) -> ChatResponse:
+    return ChatResponse(
+        conversation_id=answer.conversation_id,
+        content=answer.content,
+    )
 
 
 @router.post(path='', response_model=ChatResponse)
@@ -32,9 +36,37 @@ async def chat(
     service: ChatService = Depends(get_chat_service),
 ) -> ChatResponse:
     try:
-        return await service.handle(payload)
+        answer = await service.chat(_to_command(payload))
     except ChatError as exc:
-        status_code = _ERROR_STATUS.get(
-            type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        raise to_http_error(exc) from exc
+    return _to_response(answer)
+
+
+async def get_chat_exchange(
+    payload: ChatRequest,
+    service: ChatService = Depends(get_chat_service),
+) -> ChatExchange:
+    try:
+        return await service.prepare(_to_command(payload))
+    except ChatError as exc:
+        raise to_http_error(exc) from exc
+
+
+@router.post(path='/stream', response_class=EventSourceResponse)
+async def chat_stream(
+    exchange: ChatExchange = Depends(get_chat_exchange),
+) -> AsyncIterator[ServerSentEvent]:
+    yield ServerSentEvent(
+        event='meta',
+        data={'conversation_id': exchange.conversation_id},
+    )
+    try:
+        async for delta in exchange.stream():
+            yield ServerSentEvent(event='delta', raw_data=delta)
+    except ChatError as exc:
+        yield to_sse_event(exc)
+        return
+    yield ServerSentEvent(
+        event='done',
+        data={'conversation_id': exchange.conversation_id},
+    )

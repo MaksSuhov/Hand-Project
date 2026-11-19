@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.chat.dto import ChatMessage
+from app.application.chat.dto import ChatMessage, Role
 from app.infrastructure.db.models import Conversation, Message
 
 
@@ -21,14 +21,15 @@ class SQLAlchemyConversationRepository:
         if conversation is None:
             return None
         return [
-            ChatMessage(role=message.role, content=message.content)
+            ChatMessage(role=Role(message.role), content=message.content)
             for message in conversation.messages
         ]
 
-    async def add_message(self, conversation_id: int, role: str, content: str) -> None:
+    async def add_message(self, conversation_id: int, message: ChatMessage) -> None:
         self._session.add(
-            Message(conversation_id=conversation_id, role=role, content=content)
+            Message(
+                conversation_id=conversation_id,
+                role=message.role.value,
+                content=message.content,
+            )
         )
-
-    async def commit(self) -> None:
-        await self._session.commit()
